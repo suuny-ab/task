@@ -1,6 +1,6 @@
 "use client"
 
-import { useState, useCallback, useMemo } from "react"
+import { useState, useCallback, useMemo, useRef } from "react"
 import { TooltipProvider } from "@/components/ui/tooltip"
 import type { ProjectPhase, DrilldownNode, AIMessage, UserResponseType } from "@/lib/types"
 import { scenarios, getDrilldownNode } from "@/lib/scenario-data"
@@ -35,6 +35,11 @@ export default function Home() {
   // Selected row for drilldown
   const [selectedRowId, setSelectedRowId] = useState<string | null>(null)
   const [drilldownNode, setDrilldownNode] = useState<DrilldownNode | null>(null)
+
+  // Streaming AI summary state
+  const [streamingSummary, setStreamingSummary] = useState<Record<string, string>>({})
+  const [streamingNodeId, setStreamingNodeId] = useState<string | null>(null)
+  const abortControllerRef = useRef<AbortController | null>(null)
 
   // AI conversation messages (for building mode)
   const [aiMessages, setAiMessages] = useState<AIMessage[]>(() => {
@@ -136,18 +141,72 @@ export default function Home() {
     // Could open a rule viewer modal in production
   }, [])
 
+  // Fetch AI-generated summary for a drilldown node (streaming)
+  const fetchAISummary = useCallback(async (node: DrilldownNode) => {
+    // Abort any previous request
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort()
+    }
+    const controller = new AbortController()
+    abortControllerRef.current = controller
+
+    setStreamingNodeId(node.id)
+    setStreamingSummary((prev) => ({ ...prev, [node.id]: "" }))
+
+    try {
+      const response = await fetch("/api/drilldown", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ node }),
+        signal: controller.signal,
+      })
+
+      if (!response.ok || !response.body) {
+        setStreamingNodeId(null)
+        return
+      }
+
+      const reader = response.body.getReader()
+      const decoder = new TextDecoder()
+      let accumulated = ""
+
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        const text = decoder.decode(value, { stream: true })
+        accumulated += text
+        setStreamingSummary((prev) => ({ ...prev, [node.id]: accumulated }))
+      }
+    } catch (err) {
+      if (err instanceof DOMException && err.name === "AbortError") {
+        // Request was aborted, ignore
+      }
+    } finally {
+      if (abortControllerRef.current === controller) {
+        setStreamingNodeId(null)
+      }
+    }
+  }, [])
+
   // Handle drill row click
   const handleDrillRow = useCallback((row: Record<string, unknown>) => {
     const rowId = String(row.id ?? "")
     setSelectedRowId(rowId)
     const node = getDrilldownNode(currentScenario, rowId, row)
     setDrilldownNode(node)
-  }, [currentScenario])
+    if (node) {
+      fetchAISummary(node)
+    }
+  }, [currentScenario, fetchAISummary])
 
   // Handle close drilldown panel
   const handleCloseDrilldown = useCallback(() => {
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort()
+    }
     setSelectedRowId(null)
     setDrilldownNode(null)
+    setStreamingNodeId(null)
   }, [])
 
   // Handle adjust rule (returns to building mode)
@@ -252,6 +311,9 @@ export default function Home() {
                   rootNode={drilldownNode}
                   onClose={handleCloseDrilldown}
                   onAdjustRule={handleAdjustRule}
+                  streamingSummary={streamingSummary}
+                  streamingNodeId={streamingNodeId}
+                  onRequestAISummary={fetchAISummary}
                 />
               ) : (
                 <div className="flex flex-col items-center justify-center h-full bg-card border-l border-border p-6 text-center">

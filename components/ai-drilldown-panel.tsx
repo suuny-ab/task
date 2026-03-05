@@ -219,25 +219,33 @@ function DrilldownNodeView({
   onDrillChild,
   onAdjustRule,
   depth,
+  streamingSummary,
+  streamingNodeId,
 }: {
   node: DrilldownNode
   onDrillChild: (child: DrilldownNode) => void
   onAdjustRule?: (ruleId: string) => void
   depth: number
+  streamingSummary?: Record<string, string>
+  streamingNodeId?: string | null
 }) {
-  const [loading, setLoading] = useState(true)
+  const [loading, setLoading] = useState(false)
   const [activeTab, setActiveTab] = useState<string>("analysis")
 
+  // Only show brief loading if no streaming is active
   useEffect(() => {
+    if (streamingNodeId === node.id) {
+      setLoading(false)
+      return
+    }
     setLoading(true)
-    const delay = Math.max(600, 1200 - depth * 200)
-    const timer = setTimeout(() => setLoading(false), delay)
+    const timer = setTimeout(() => setLoading(false), 300)
     return () => clearTimeout(timer)
-  }, [node.id, depth])
+  }, [node.id, streamingNodeId])
 
   if (loading) return <AnalysisLoading />
 
-  const hasChildren = node.children && node.children.length > 0
+  const hasChildren = !!(node.children && node.children.length > 0)
   const isLeaf = !hasChildren
   const hasLineage = !!node.lineage
   const hasRules = node.appliedRules && node.appliedRules.length > 0
@@ -275,7 +283,9 @@ function DrilldownNodeView({
               node={node} 
               onDrillChild={onDrillChild} 
               isLeaf={isLeaf} 
-              hasChildren={hasChildren} 
+              hasChildren={hasChildren}
+              streamingSummary={streamingSummary}
+              streamingNodeId={streamingNodeId}
             />
           </TabsContent>
           
@@ -296,7 +306,9 @@ function DrilldownNodeView({
           node={node} 
           onDrillChild={onDrillChild} 
           isLeaf={isLeaf} 
-          hasChildren={hasChildren} 
+          hasChildren={hasChildren}
+          streamingSummary={streamingSummary}
+          streamingNodeId={streamingNodeId}
         />
       )}
     </div>
@@ -308,19 +320,39 @@ function AnalysisContent({
   onDrillChild,
   isLeaf,
   hasChildren,
+  streamingSummary,
+  streamingNodeId,
 }: {
   node: DrilldownNode
   onDrillChild: (child: DrilldownNode) => void
   isLeaf: boolean
   hasChildren: boolean
+  streamingSummary?: Record<string, string>
+  streamingNodeId?: string | null
 }) {
+  // Determine what to display as AI summary
+  const aiText = streamingSummary?.[node.id] ?? ""
+  const isStreaming = streamingNodeId === node.id
+  const hasStreamedContent = aiText.length > 0
+  // Use streamed content if available, otherwise fall back to hardcoded aiSummary
+  const displayText = hasStreamedContent ? aiText : node.aiSummary
+
   return (
     <div className="flex flex-col gap-4">
       {/* AI Summary */}
       <div className="flex items-start gap-2 rounded-lg bg-secondary/50 p-3">
         <Sparkles className="h-4 w-4 text-primary mt-0.5 shrink-0" />
         <p className="text-sm leading-relaxed text-foreground">
-          <TypewriterText text={node.aiSummary} />
+          {isStreaming ? (
+            <span>
+              {displayText}
+              <span className="inline-block w-0.5 h-4 bg-primary ml-0.5 animate-pulse" />
+            </span>
+          ) : hasStreamedContent ? (
+            <span>{displayText}</span>
+          ) : (
+            <TypewriterText text={displayText} />
+          )}
         </p>
       </div>
 
@@ -437,9 +469,12 @@ interface AIDrilldownPanelProps {
   rootNode: DrilldownNode
   onClose: () => void
   onAdjustRule?: (ruleId: string) => void
+  streamingSummary?: Record<string, string>
+  streamingNodeId?: string | null
+  onRequestAISummary?: (node: DrilldownNode) => void
 }
 
-export function AIDrilldownPanel({ rootNode, onClose, onAdjustRule }: AIDrilldownPanelProps) {
+export function AIDrilldownPanel({ rootNode, onClose, onAdjustRule, streamingSummary, streamingNodeId, onRequestAISummary }: AIDrilldownPanelProps) {
   const [breadcrumbs, setBreadcrumbs] = useState<DrilldownNode[]>([rootNode])
 
   // Reset breadcrumbs when rootNode changes
@@ -451,7 +486,10 @@ export function AIDrilldownPanel({ rootNode, onClose, onAdjustRule }: AIDrilldow
 
   const handleDrillChild = useCallback((child: DrilldownNode) => {
     setBreadcrumbs((prev) => [...prev, child])
-  }, [])
+    if (onRequestAISummary) {
+      onRequestAISummary(child)
+    }
+  }, [onRequestAISummary])
 
   const handleGoBack = useCallback(() => {
     if (breadcrumbs.length <= 1) return
@@ -532,6 +570,8 @@ export function AIDrilldownPanel({ rootNode, onClose, onAdjustRule }: AIDrilldow
             onDrillChild={handleDrillChild}
             onAdjustRule={onAdjustRule}
             depth={depth}
+            streamingSummary={streamingSummary}
+            streamingNodeId={streamingNodeId}
           />
         </div>
       </ScrollArea>

@@ -357,7 +357,406 @@
 
 ---
 
-## 四、总结
+## 四、功能选择与实现决策
+
+### 4.1 背景约束
+
+- 求职面试任务，面试官提供 UI 原型，要求自选未完成功能进行实现
+- 应聘岗位：**AI 应用工程师**
+- 时间限制：**1 天**
+- 部署目标：面试官的 Vercel 服务器
+
+### 4.2 选择实现的功能：AI 下钻解读接入 LLM（P0）
+
+**选择理由：**
+
+1. **与岗位最匹配**：AI 应用工程师的核心能力是 LLM 集成、Prompt 设计、AI 产品交互。AI 下钻解读正是整个产品最核心的 AI 功能，直接展示这些能力。
+2. **展示效果最直观**：面试官打开页面，点击结论表中任意一行，右侧面板 AI 实时流式生成解读文案（替代原来的硬编码文字）。无需解释，效果一目了然。
+3. **通用性设计**：本应用不限于奖金核算，适用于任何"底表 → 结论表 → 逐层下钻解读"的场景（直播分佣、物流时效等）。Prompt 设计基于数据结构本身（维度、指标、子节点、规则、公式），不绑定任何具体业务语义，AI 通过读取数据自行推断场景。
+4. **改动可控**：保留原有的 Mock 数据结构（values、children、rules），仅将硬编码的 `aiSummary` 替换为 LLM 实时生成。改动集中、风险低，1 天内可完成。
+
+**不选择的功能及理由：**
+
+| 功能 | 不选理由 |
+|------|---------|
+| Excel 解析 | 偏基础设施，与 AI 岗位关联弱，展示价值低 |
+| 数据库持久化 | 不是 AI 能力，1 天内做不精 |
+| 动态计算引擎 | 工作量大，需实现完整计算逻辑，超出时间 |
+| 用户认证 | 与岗位完全无关 |
+
+### 4.3 实现方案：方案 A（替换 aiSummary 生成方式）
+
+**方案说明：**
+- `values`、`children`、`rules` 等下钻树数据保持原有 Mock 结构不变
+- 仅将 `aiSummary`（当前硬编码的解读文案）改为实时调用 LLM 流式生成
+- 前端展示真实的流式打字效果（非本地模拟）
+
+**未采纳的方案 B：**
+- 连数据结构（子节点、指标值）也由 LLM 动态生成
+- 理由：LLM 生成结构化数据容易出错，1 天内做不稳定，且收益不大
+
+### 4.4 技术选型
+
+- LLM 服务：**DeepSeek**（国内模型，API 兼容 OpenAI 格式，价格低，中文能力强）
+- SDK：`openai` JS SDK（DeepSeek API 兼容 OpenAI 协议，可直接复用）
+- 后端：Next.js API Route（与前端同项目，部署到 Vercel 自动变为 Serverless Function）
+- 响应方式：流式（Streaming），避免用户等待空白，实现逐字输出效果
+
+### 4.5 Prompt 设计方案
+
+#### 设计思路
+
+通过观察三个完整下钻树（张三/销售奖金、李佳琦/直播分佣、华东仓/物流时效），发现所有场景的 `aiSummary` 遵循共同模式：
+
+- **Level 1-2（非叶子节点）：** 陈述核心指标 → 解释指标间计算关系 → 提及子节点构成概况
+- **Level 3（叶子节点）：** 列出原始数据 → 引用规则/系数 → 展示计算结果
+
+AI 不需要知道具体业务场景，只需根据节点数据中"有什么字段"来决定"说什么话"。
+
+#### 方案选择：按节点类型分两个 Prompt 模板（方案 B）
+
+**未采纳的方式 A（单一 Prompt）：**
+- 一个 System Prompt 覆盖所有情况，让 AI 自己判断节点类型
+- 缺点：AI 可能遗漏信息或格式不稳定
+
+**采纳的方式 B（分类型模板）：**
+- 代码中判断节点是否为叶子节点（`children` 是否存在且非空）
+- 非叶子节点和叶子节点各使用独立的 Prompt 模板
+- 优点：输出更稳定可控，每种模板可以精确引导 AI 关注该类型的重点信息
+
+#### 通用设计原则
+
+- **通用性**：Prompt 不包含任何具体业务场景词汇（不写"奖金"、"分佣"、"物流"），维度名称、指标名称全部来自数据本身
+- **结构化输入**：将 DrilldownNode 的字段（label、levelLabel、values、children、formula、appliedRules、lineage）序列化为统一文本模板传入
+- **区分节点类型**：非叶子节点侧重解读指标关系和子节点构成；叶子节点侧重解释计算公式和规则引用
+
+#### 非叶子节点 Prompt 模板
+
+**System Prompt：**
+```
+你是一个数据分析解读助手。用户会给你一个数据节点的结构化信息。
+你的任务是用简洁的中文解读这个节点的数据含义。
+
+要求：
+1. 先陈述核心指标数据
+2. 解释关键指标之间的计算关系（如果有规则信息）
+3. 说明子节点的构成概况（谁贡献最多、占比如何）
+4. 如果有异常值或值得注意的特征，主动指出
+5. 面向非技术人员，避免术语
+6. 简洁，控制在 3-5 句话
+7. 直接陈述事实，不要用"让我来分析"之类的开场白
+```
+
+**User Prompt 数据模板：**
+```
+当前节点：
+  维度：{levelLabel}
+  名称：{label}
+  指标：
+    - {values[0].label}: {格式化后的值}
+    - {values[1].label}: {格式化后的值}
+    ...
+
+子节点（{children.length} 个{children[0].levelLabel}）：
+  - {child.label}: {child 的 highlight 值或首个值}
+  - ...
+
+应用的规则（如有）：
+  - {rule.name}: {rule.description}
+    公式: {rule.formula}
+    条件: {rule.conditions}
+
+数据血缘（如有）：
+  来源表: {lineage.sourceColumns的描述}
+  计算步骤: {lineage.transformations的描述}
+```
+
+#### 叶子节点 Prompt 模板
+
+**System Prompt：**
+```
+你是一个数据分析解读助手。用户会给你一个最细粒度的数据节点信息，
+包含具体的计算公式和应用的规则。
+
+你的任务是用简洁的中文解释这个计算过程。
+
+要求：
+1. 列出原始数据
+2. 说明应用了什么规则，引用规则原文
+3. 展示计算公式的含义
+4. 给出最终结果
+5. 面向非技术人员，避免术语
+6. 简洁，控制在 2-3 句话
+7. 直接陈述事实，不要用"让我来分析"之类的开场白
+```
+
+**User Prompt 数据模板：**
+```
+当前节点：
+  维度：{levelLabel}
+  名称：{label}
+  指标：
+    - {values[0].label}: {格式化后的值}
+    - ...
+
+计算公式：
+  {formulaLabel}: {formula}
+
+应用的规则：
+  - {rule.name}: {rule.description}
+    规则原文: {rule.sourceText}
+    条件: {rule.conditions}
+```
+
+### 4.6 AI 下钻解读流程与接口定义
+
+#### 前置条件
+
+下钻树（`DrilldownNode`）由前置的构建流程生成。当前原型中为硬编码 Mock，未来由构建阶段根据底表、中间表、结论表和规则自动生成。AI 下钻解读模块不关心树是怎么来的，只接收 `DrilldownNode` 作为输入。
+
+#### 完整调用流程
+
+```
+用户在解读模式点击结论表某一行
+      ↓
+page.tsx: handleDrillRow(row)
+      ↓
+getDrilldownNode() 返回该行对应的 DrilldownNode
+      ↓
+前端拿到 DrilldownNode，展示 values / children / rules 等结构化数据
+      ↓
+同时，前端从 DrilldownNode 中提取 AI 所需字段
+      ↓
+判断节点类型：children 存在且非空 → branch，否则 → leaf
+      ↓
+调用 POST /api/drilldown，传入裁剪后的数据
+      ↓
+后端根据 nodeType 选择对应的 Prompt 模板
+      ↓
+组装 System Prompt + User Prompt
+      ↓
+调用 DeepSeek API（流式模式）
+      ↓
+流式返回文本，前端逐字渲染替代原来的硬编码 aiSummary
+```
+
+#### 输入数据结构：DrilldownNode（前置流程提供）
+
+前置流程（构建阶段）需要为每个可下钻的结论表行生成如下结构的 `DrilldownNode`：
+
+```typescript
+// 来自 lib/types.ts，这是前置流程的输出、AI 解读的输入
+interface DrilldownNode {
+  id: string
+  label: string                // 节点名称，如 "张三"、"华东仓"
+  levelLabel: string           // 维度名称，如 "销售"、"仓库"
+  levelIcon: string            // UI 图标名称
+
+  values: DrilldownField[]     // 关键指标数组
+  aiSummary: string            // ← 当前硬编码，将改为 AI 实时生成
+
+  formula?: string             // 叶子节点：计算公式，如 "58.00 万 × 1.0 = 58.00 万"
+  formulaLabel?: string        // 叶子节点：公式含义，如 "原始消费 × 产品系数 = 有效业绩"
+
+  childrenLabel?: string       // 非叶子节点：子节点分组标题，如 "客户贡献明细（Top 5）"
+  children?: DrilldownNode[]   // 非叶子节点：子节点数组
+
+  lineage?: DataLineage        // 数据血缘（Level 1 可能有）
+  appliedRules?: Rule[]        // 应用的计算规则
+}
+
+interface DrilldownField {
+  key: string
+  label: string                // 指标名称，如 "总营收"
+  value: string | number       // 指标值，如 5280000
+  format: "text" | "number" | "currency" | "percent" | "coefficient"
+  highlight?: boolean          // 是否为核心结论指标
+}
+
+interface DataLineage {
+  sourceColumns: {
+    tableId: string
+    tableName: string          // 来源表名，如 "销售业绩明细表"
+    columnKey: string
+    columnLabel: string        // 来源列名，如 "消费金额"
+  }[]
+  transformations: {
+    stepId: string
+    stepTitle: string          // 步骤名称，如 "系数折算"
+    description: string        // 步骤描述
+  }[]
+}
+
+interface Rule {
+  id: string
+  name: string                 // 规则名称，如 "产品系数规则"
+  description: string          // 规则描述
+  formula?: string             // 计算公式，如 "有效业绩 = 原始消费 × 产品系数"
+  conditions?: string          // 条件，如 "云服务器 ECS: 1.0; 对象存储 OSS: 0.8"
+  sourceText: string           // 规则原文
+  // ... 其他字段 AI 解读不使用
+}
+```
+
+#### 节点类型判定规则
+
+```
+if (node.children && node.children.length > 0) → branch（非叶子节点）
+else → leaf（叶子节点）
+```
+
+#### API 接口：POST /api/drilldown
+
+**请求结构：**
+
+```typescript
+interface DrilldownRequest {
+  nodeType: "branch" | "leaf"
+  node: BranchNodeInput | LeafNodeInput
+}
+```
+
+**非叶子节点输入（branch）——前端从 DrilldownNode 中提取并裁剪：**
+
+```typescript
+interface BranchNodeInput {
+  label: string                // ← DrilldownNode.label
+  levelLabel: string           // ← DrilldownNode.levelLabel
+  values: {                    // ← DrilldownNode.values，数值格式化为可读字符串
+    label: string
+    value: string              // 格式化后，如 "528.00 万"、"2.5%"
+    highlight?: boolean
+  }[]
+  childrenLabel?: string       // ← DrilldownNode.childrenLabel
+  childrenSummary?: {          // ← 从 DrilldownNode.children 裁剪，只保留摘要
+    label: string              //    child.label
+    levelLabel: string         //    child.levelLabel
+    keyValue: string           //    child 中 highlight 字段的格式化值
+  }[]
+  rules?: {                    // ← DrilldownNode.appliedRules 裁剪
+    name: string
+    description: string
+    formula?: string
+    conditions?: string
+  }[]
+  lineage?: {                  // ← DrilldownNode.lineage 裁剪
+    source: string             //    拼接为 "表名.列名" 格式
+    steps: string[]            //    每个 transformation 的 "标题：描述"
+  }
+}
+```
+
+**叶子节点输入（leaf）——前端从 DrilldownNode 中提取：**
+
+```typescript
+interface LeafNodeInput {
+  label: string                // ← DrilldownNode.label
+  levelLabel: string           // ← DrilldownNode.levelLabel
+  values: {                    // ← DrilldownNode.values，数值格式化为可读字符串
+    label: string
+    value: string
+    highlight?: boolean
+  }[]
+  formula: string              // ← DrilldownNode.formula
+  formulaLabel: string         // ← DrilldownNode.formulaLabel
+  rules?: {                    // ← DrilldownNode.appliedRules 裁剪
+    name: string
+    description: string
+    sourceText?: string        // 叶子节点带规则原文，用于 AI 引用
+    conditions?: string
+  }[]
+}
+```
+
+**响应：流式文本**
+
+```
+Content-Type: text/event-stream
+每个 chunk 为一段文本片段，前端逐步拼接渲染
+```
+
+#### 数据裁剪示例
+
+以张三（非叶子节点）为例，展示从 `DrilldownNode` 到 `BranchNodeInput` 的裁剪过程：
+
+```
+DrilldownNode（前置流程提供，完整树）         BranchNodeInput（发给 API，裁剪后）
+─────────────────────────────────         ──────────────────────────────────
+id: "s1"                                  ×（不传）
+label: "张三"                          →  label: "张三"
+levelLabel: "销售"                     →  levelLabel: "销售"
+levelIcon: "User"                         ×（不传，纯 UI）
+aiSummary: "张三本期..."                  ×（不传，这是输出不是输入）
+                                      
+values: [                              →  values: [
+  { key: "totalRevenue",                    { label: "总营收",
+    label: "总营收",                          value: "528.00 万" },     ← 数值格式化
+    value: 5280000,                         { label: "有效业绩",
+    format: "currency" },                     value: "452.00 万" },
+  ...                                       { label: "奖金比例",
+]                                             value: "2.5%" },
+                                            { label: "应发奖金",
+                                              value: "11.30 万",
+                                              highlight: true }
+                                          ]
+
+childrenLabel: "客户贡献明细（Top 5）"  →  childrenLabel: "客户贡献明细（Top 5）"
+children: [                            →  childrenSummary: [
+  { id: "c1-1",                             { label: "上海云途科技有限公司",
+    label: "上海云途科技有限公司",               levelLabel: "客户",
+    levelLabel: "客户",                        keyValue: "奖金贡献 3.30 万" },
+    values: [...],                          { label: "杭州数联信息技术",
+    children: [                               levelLabel: "客户",
+      { 云服务器 ECS... },                     keyValue: "奖金贡献 2.13 万" },
+      { 对象存储 OSS... },    ← 全部丢弃    { label: "苏州智算科技",
+      { 云数据库 RDS... },                     levelLabel: "客户",
+    ],                                        keyValue: "奖金贡献 1.55 万" }
+    aiSummary: "...",         ← 丢弃      ]
+  },
+  ...
+]
+
+appliedRules: [                        →  rules: [
+  { id: "rule-bonus-1",                    { name: "产品系数规则",
+    name: "产品系数规则",                     description: "不同产品按不同系数折算有效业绩",
+    description: "...",                      formula: "有效业绩 = 原始消费 × 产品系数",
+    formula: "...",                          conditions: "云服务器 ECS: 1.0; ..." },
+    conditions: "...",                     { name: "奖金比例规则",
+    sourceDocId: "...",       ← 丢弃        description: "根据有效业绩分档确定奖金比例",
+    sourceText: "...",        ← 丢弃        formula: "奖金 = 有效业绩 × 奖金比例",
+    matchedBaseColumns: [...] ← 丢弃        conditions: "有效业绩 ≥ 400万: 2.5%; ..." }
+    affectedColumns: [...]    ← 丢弃      ]
+  },
+  ...
+]
+
+lineage: {                             →  lineage: {
+  sourceColumns: [{                        source: "销售业绩明细表.消费金额",
+    tableId: "tbl-bonus-base",             steps: [
+    tableName: "销售业绩明细表",               "系数折算：各产品消费按产品系数折算为有效业绩",
+    columnKey: "revenue",                    "汇总计算：按销售人员汇总有效业绩，应用奖金比例规则"
+    columnLabel: "消费金额"                 ]
+  }],                                    }
+  transformations: [{
+    stepId: "step-bonus-4",   ← 丢弃
+    stepTitle: "系数折算",
+    description: "各产品消费按..."
+  }, ...]
+}
+```
+
+#### 裁剪原则总结
+
+| 裁剪操作 | 原因 |
+|---------|------|
+| 去掉 `id`、`levelIcon` | 内部标识和 UI 字段，AI 不需要 |
+| 去掉 `aiSummary` | 这是 AI 的输出，不是输入 |
+| `values` 的数值预先格式化为字符串 | 避免 AI 自行格式化出错（如把 5280000 写成"五百二十八万"） |
+| `children` 裁剪为 `childrenSummary` | AI 只需知道子节点概况，不需要完整嵌套树 |
+| `appliedRules` 去掉 `id`、`sourceDocId`、`affectedColumns`、`matchedBaseColumns` | 内部关联字段，AI 不需要 |
+| `lineage` 去掉 `tableId`、`stepId` | 内部标识，AI 只需要可读的描述文本 |
+| 叶子节点的 `rules` 保留 `sourceText` | 叶子节点需要 AI 引用规则原文 |
+| 非叶子节点的 `rules` 保留 `formula` | 非叶子节点需要 AI 解释宏观计算关系 |
 
 ### 当前状态一句话
 > **UI 高保真原型，交互流程完整，但所有数据和 AI 能力都是硬编码 Mock。**
@@ -369,7 +768,7 @@
 
 ---
 
-## 五、技术栈
+## 六、技术栈
 
 - Next.js 16 / React 19 / TypeScript
 - shadcn/ui / Tailwind CSS
@@ -377,7 +776,7 @@
 
 ---
 
-## 六、部署
+## 七、部署
 
 - 平台：Vercel
 - 状态：待部署
